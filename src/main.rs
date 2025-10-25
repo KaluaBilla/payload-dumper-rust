@@ -1,3 +1,4 @@
+#![feature(specialization)]
 mod module;
 use crate::module::args::Args;
 #[cfg(feature = "remote_ota")]
