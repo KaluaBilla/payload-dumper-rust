@@ -17,18 +17,185 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+// ============================================================================
+// OPTIMIZED READ AT OFFSET - EXTENSION TRAIT
+// ============================================================================
+
+/// Extension trait for optimized random access reads
+pub trait ReadAtOffset {
+    /// Read exact amount of data at a specific offset
+    /// Default implementation uses seek + read (2 syscalls)
+    /// File implementation uses read_exact_at (1 syscall)
+    fn read_at_offset(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
+}
+
+// ============================================================================
+// FILE IMPLEMENTATION (OPTIMIZED)
+// ============================================================================
+
+impl ReadAtOffset for File {
+    #[inline]
+    fn read_at_offset(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.read_exact_at(buf, offset)?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            self.seek_read(buf, offset)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.seek(SeekFrom::Start(offset))?;
+            self.read_exact(buf)?;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// DEFAULT IMPLEMENTATION FOR ALL OTHER TYPES
+// ============================================================================
+
+impl<T: Read + Seek + ?Sized> ReadAtOffset for T {
+    #[inline]
+    default fn read_at_offset(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.seek(SeekFrom::Start(offset))?;
+        self.read_exact(buf)?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// MMAP READER (OPTIMIZED)
+// ============================================================================
+
+pub struct MmapReader {
+    mmap: memmap2::Mmap,
+    position: u64,
+}
+
+impl MmapReader {
+    pub fn new(file: File) -> Result<Self> {
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Ok(Self { mmap, position: 0 })
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.mmap.len()
+    }
+}
+
+impl Read for MmapReader {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let start = self.position as usize;
+        if start >= self.len() {
+            return Ok(0); // EOF
+        }
+
+        let end = std::cmp::min(start + buf.len(), self.len());
+        let bytes_to_read = end - start;
+
+        buf[..bytes_to_read].copy_from_slice(&self.mmap[start..end]);
+        self.position += bytes_to_read as u64;
+
+        Ok(bytes_to_read)
+    }
+}
+
+impl Seek for MmapReader {
+    #[inline]
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::Current(offset) => {
+                if offset >= 0 {
+                    self.position.saturating_add(offset as u64)
+                } else {
+                    self.position.saturating_sub(offset.unsigned_abs())
+                }
+            }
+            SeekFrom::End(offset) => {
+                let file_size = self.len() as u64;
+                if offset >= 0 {
+                    file_size.saturating_add(offset as u64)
+                } else {
+                    file_size.saturating_sub(offset.unsigned_abs())
+                }
+            }
+        };
+
+        if new_pos > self.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Attempted to seek past end of file",
+            ));
+        }
+
+        self.position = new_pos;
+        Ok(self.position)
+    }
+}
+
+impl ReadAtOffset for MmapReader {
+    #[inline]
+    fn read_at_offset(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let start = offset as usize;
+        let end = start + buf.len();
+
+        if end > self.len() {
+            return Err(anyhow!("Read beyond end of mapped file"));
+        }
+
+        buf.copy_from_slice(&self.mmap[start..end]);
+        Ok(())
+    }
+}
+
+// ============================================================================
+// OPTIMIZED CURSOR IMPLEMENTATION
+// ============================================================================
+
+impl<T: AsRef<[u8]>> ReadAtOffset for Cursor<T> {
+    #[inline]
+    fn read_at_offset(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let start = offset as usize;
+        let end = start + buf.len();
+        let inner = self.get_ref().as_ref();
+
+        if end > inner.len() {
+            return Err(anyhow!("Read beyond end of cursor"));
+        }
+
+        buf.copy_from_slice(&inner[start..end]);
+        Ok(())
+    }
+}
+
+// ============================================================================
+// OPTIMIZED OPERATION PROCESSING
+// ============================================================================
+
 pub fn process_operation(
     operation_index: usize,
     op: &InstallOperation,
     data_offset: u64,
     block_size: u64,
-    payload_file: &mut (impl Read + Seek),
+    payload_file: &mut (impl ReadAtOffset + Read + Seek),
     out_file: &mut (impl Write + Seek),
     #[allow(unused_variables)] old_file: Option<&mut dyn ReadSeek>,
 ) -> Result<()> {
-    payload_file.seek(SeekFrom::Start(data_offset + op.data_offset.unwrap_or(0)))?;
-    let mut data = vec![0u8; op.data_length.unwrap_or(0) as usize];
-    payload_file.read_exact(&mut data)?;
+    // Optimized read: uses read_exact_at for files, seek+read for others
+    let data_length = op.data_length.unwrap_or(0) as usize;
+    let mut data = vec![0u8; data_length];
+
+    if data_length > 0 {
+        payload_file.read_at_offset(data_offset + op.data_offset.unwrap_or(0), &mut data)?;
+    }
 
     match op.r#type() {
         install_operation::Type::ReplaceXz => match liblzma::decode_all(Cursor::new(&data)) {
@@ -69,7 +236,7 @@ pub fn process_operation(
             }
             Err(e) => {
                 println!(
-                    "  Warning: Skipping operation {} due to unknown Zstd format: {}",
+                    "  Warning: Skipping operation {} due to Zstd decompression error: {}",
                     operation_index, e
                 );
                 return Ok(());
@@ -87,7 +254,7 @@ pub fn process_operation(
                 }
                 Err(e) => {
                     println!(
-                        " Warning: Skipping operation {} due to unknown BZ2 format.  : {}",
+                        "  Warning: Skipping operation {} due to BZ2 decompression error: {}",
                         operation_index, e
                     );
                     return Ok(());
@@ -108,11 +275,24 @@ pub fn process_operation(
                 out_file.seek(SeekFrom::Start(
                     op.dst_extents[0].start_block.unwrap_or(0) * block_size,
                 ))?;
+
+                // Reuse buffer for better performance
+                let mut buffer = vec![0u8; (block_size * 128) as usize]; // 128 blocks at once
+
                 for ext in &op.src_extents {
-                    old_file.seek(SeekFrom::Start(ext.start_block.unwrap_or(0) * block_size))?;
-                    let mut buffer = vec![0u8; (ext.num_blocks.unwrap_or(0) * block_size) as usize];
-                    old_file.read_exact(&mut buffer)?;
-                    out_file.write_all(&buffer)?;
+                    let total_size = (ext.num_blocks.unwrap_or(0) * block_size) as usize;
+                    let mut remaining = total_size;
+                    let mut current_offset = ext.start_block.unwrap_or(0) * block_size;
+
+                    while remaining > 0 {
+                        let chunk_size = std::cmp::min(remaining, buffer.len());
+                        old_file.seek(SeekFrom::Start(current_offset))?;
+                        old_file.read_exact(&mut buffer[..chunk_size])?;
+                        out_file.write_all(&buffer[..chunk_size])?;
+
+                        remaining -= chunk_size;
+                        current_offset += chunk_size as u64;
+                    }
                 }
             }
             #[cfg(not(feature = "differential_ota"))]
@@ -135,6 +315,7 @@ pub fn process_operation(
                 old_file.read_exact(&mut buffer)?;
                 old_data.extend_from_slice(&buffer);
             }
+
             let new_data = match bspatch(&old_data, &data) {
                 Ok(new_data) => new_data,
                 Err(e) => {
@@ -145,6 +326,7 @@ pub fn process_operation(
                     return Ok(());
                 }
             };
+
             let mut pos = 0;
             for ext in &op.dst_extents {
                 let ext_size = (ext.num_blocks.unwrap_or(0) * block_size) as usize;
@@ -279,11 +461,17 @@ pub fn process_operation(
             }
         }
         install_operation::Type::Zero => {
-            let zeros = vec![0u8; block_size as usize];
+            let zeros = vec![0u8; (block_size * 128) as usize]; // Write 128 blocks at once
             for ext in &op.dst_extents {
                 out_file.seek(SeekFrom::Start(ext.start_block.unwrap_or(0) * block_size))?;
-                for _ in 0..ext.num_blocks.unwrap_or(0) {
-                    out_file.write_all(&zeros)?;
+                let total_blocks = ext.num_blocks.unwrap_or(0);
+                let mut remaining_blocks = total_blocks;
+
+                while remaining_blocks > 0 {
+                    let blocks_to_write = std::cmp::min(remaining_blocks, 128);
+                    let bytes_to_write = (blocks_to_write * block_size) as usize;
+                    out_file.write_all(&zeros[..bytes_to_write])?;
+                    remaining_blocks -= blocks_to_write;
                 }
             }
         }
@@ -307,16 +495,21 @@ pub fn process_operation(
     Ok(())
 }
 
+// ============================================================================
+// PARTITION DUMPING
+// ============================================================================
+
 pub fn dump_partition(
     partition: &PartitionUpdate,
     data_offset: u64,
     block_size: u64,
     args: &Args,
-    payload_file: &mut (impl Read + Seek),
+    payload_file: &mut (impl ReadAtOffset + Read + Seek),
     multi_progress: Option<&MultiProgress>,
 ) -> Result<()> {
     let partition_name = &partition.partition_name;
     let total_ops = partition.operations.len() as u64;
+
     let progress_bar = if let Some(mp) = multi_progress {
         let pb = mp.add(ProgressBar::new(100));
         pb.set_style(ProgressStyle::default_bar()
@@ -329,10 +522,12 @@ pub fn dump_partition(
     } else {
         None
     };
+
     let out_dir = &args.out;
     if args.out.to_string_lossy() != "-" {
         fs::create_dir_all(out_dir)?;
     }
+
     let out_path = out_dir.join(format!("{}.img", partition_name));
     let mut out_file = File::create(&out_path)?;
 
@@ -374,6 +569,7 @@ pub fn dump_partition(
     #[cfg(not(feature = "differential_ota"))]
     let mut old_file: Option<File> = None;
 
+    // Process operations with optimized read
     for (i, op) in partition.operations.iter().enumerate() {
         process_operation(
             i,
@@ -390,83 +586,38 @@ pub fn dump_partition(
             pb.set_position(percentage);
         }
     }
+
     if let Some(pb) = progress_bar {
         pb.finish_with_message(format!(
             "✓ Completed {} ({} ops)",
             partition_name, total_ops
         ));
     }
+
     Ok(())
 }
 
+// ============================================================================
+// PAYLOAD READER FACTORY
+// ============================================================================
+
 pub fn create_payload_reader(path: &PathBuf) -> Result<Box<dyn ReadSeek>> {
     let file = File::open(path)?;
-
     let file_size = file.metadata()?.len();
 
+    // Use memory mapping for large files (>10MB)
     if file_size > 10 * 1024 * 1024 {
         match unsafe { memmap2::Mmap::map(&file) } {
             Ok(mmap) => {
-                struct MmapReader {
-                    mmap: memmap2::Mmap,
-                    position: u64,
-                }
-
-                impl Read for MmapReader {
-                    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                        let start = self.position as usize;
-                        if start >= self.mmap.len() {
-                            return Ok(0); // EOF
-                        }
-
-                        let end = std::cmp::min(start + buf.len(), self.mmap.len());
-                        let bytes_to_read = end - start;
-
-                        buf[..bytes_to_read].copy_from_slice(&self.mmap[start..end]);
-                        self.position += bytes_to_read as u64;
-
-                        Ok(bytes_to_read)
-                    }
-                }
-
-                impl Seek for MmapReader {
-                    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-                        let new_pos = match pos {
-                            SeekFrom::Start(offset) => offset,
-                            SeekFrom::Current(offset) => {
-                                if offset >= 0 {
-                                    self.position.saturating_add(offset as u64)
-                                } else {
-                                    self.position.saturating_sub(offset.unsigned_abs())
-                                }
-                            }
-                            SeekFrom::End(offset) => {
-                                let file_size = self.mmap.len() as u64;
-                                if offset >= 0 {
-                                    file_size.saturating_add(offset as u64)
-                                } else {
-                                    file_size.saturating_sub(offset.unsigned_abs())
-                                }
-                            }
-                        };
-
-                        if new_pos > self.mmap.len() as u64 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "Attempted to seek past end of file",
-                            ));
-                        }
-
-                        self.position = new_pos;
-                        Ok(self.position)
-                    }
-                }
-
-                Ok(Box::new(MmapReader { mmap, position: 0 }) as Box<dyn ReadSeek>)
+                return Ok(Box::new(MmapReader { mmap, position: 0 }) as Box<dyn ReadSeek>);
             }
-            Err(_) => Ok(Box::new(file) as Box<dyn ReadSeek>),
+            Err(_) => {
+                // Fall back to regular file if mmap fails
+                let file = File::open(path)?;
+                return Ok(Box::new(file) as Box<dyn ReadSeek>);
+            }
         }
-    } else {
-        Ok(Box::new(file) as Box<dyn ReadSeek>)
     }
+
+    Ok(Box::new(file) as Box<dyn ReadSeek>)
 }
