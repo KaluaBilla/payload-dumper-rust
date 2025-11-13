@@ -11,9 +11,6 @@ pub use crate::PartitionUpdate;
 use crate::args::Args;
 use crate::{InstallOperation, install_operation};
 
-const BUFREADER_SIZE: usize = 64 * 1024; // 64 KB for BufReader (decompression streams)
-const COPY_BUFFER_SIZE: usize = 128 * 1024; // 128 KB for direct copy operations
-
 #[async_trait]
 pub trait AsyncPayloadRead: Send + Sync {
     async fn open_reader(&self) -> Result<Box<dyn PayloadReader>>;
@@ -42,27 +39,6 @@ impl AsyncPayloadRead for Arc<dyn AsyncPayloadRead> {
     }
 }
 
-/// custom copy function with configurable buffer size
-async fn copy_with_buffer<R, W>(reader: &mut R, writer: &mut W) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    let mut buf = vec![0u8; COPY_BUFFER_SIZE];
-    let mut total = 0u64;
-
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n]).await?;
-        total += n as u64;
-    }
-
-    Ok(total)
-}
-
 async fn process_operation_streaming(
     operation_index: usize,
     op: &InstallOperation,
@@ -82,17 +58,17 @@ async fn process_operation_streaming(
                     op.dst_extents[0].start_block.unwrap_or(0) * block_size,
                 ))
                 .await?;
-            copy_with_buffer(&mut stream, out_file).await?;
+            tokio::io::copy(&mut stream, out_file).await?;
         }
         install_operation::Type::ReplaceXz => {
             let stream = payload_reader.read_range(offset, length).await?;
-            let mut decoder = XzDecoder::new(BufReader::with_capacity(BUFREADER_SIZE, stream));
+            let mut decoder = XzDecoder::new(BufReader::new(stream));
             out_file
                 .seek(std::io::SeekFrom::Start(
                     op.dst_extents[0].start_block.unwrap_or(0) * block_size,
                 ))
                 .await?;
-            match copy_with_buffer(&mut decoder, out_file).await {
+            match tokio::io::copy(&mut decoder, out_file).await {
                 Ok(_) => {}
                 Err(e) => {
                     println!(
@@ -105,13 +81,13 @@ async fn process_operation_streaming(
         }
         install_operation::Type::ReplaceBz => {
             let stream = payload_reader.read_range(offset, length).await?;
-            let mut decoder = BzDecoder::new(BufReader::with_capacity(BUFREADER_SIZE, stream));
+            let mut decoder = BzDecoder::new(BufReader::new(stream));
             out_file
                 .seek(std::io::SeekFrom::Start(
                     op.dst_extents[0].start_block.unwrap_or(0) * block_size,
                 ))
                 .await?;
-            match copy_with_buffer(&mut decoder, out_file).await {
+            match tokio::io::copy(&mut decoder, out_file).await {
                 Ok(_) => {}
                 Err(e) => {
                     println!(
@@ -124,7 +100,7 @@ async fn process_operation_streaming(
         }
         install_operation::Type::Zstd => {
             let stream = payload_reader.read_range(offset, length).await?;
-            let mut decoder = ZstdDecoder::new(BufReader::with_capacity(BUFREADER_SIZE, stream));
+            let mut decoder = ZstdDecoder::new(BufReader::new(stream));
 
             if op.dst_extents.len() == 1 {
                 out_file
@@ -132,7 +108,7 @@ async fn process_operation_streaming(
                         op.dst_extents[0].start_block.unwrap_or(0) * block_size,
                     ))
                     .await?;
-                match copy_with_buffer(&mut decoder, out_file).await {
+                match tokio::io::copy(&mut decoder, out_file).await {
                     Ok(_) => {}
                     Err(e) => {
                         println!(
