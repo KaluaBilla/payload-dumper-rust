@@ -7,7 +7,7 @@ use cli::entry::run;
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("Error: {}", e);
+        eprintln!("{:#?}", e);
         std::process::exit(1);
     }
 }
